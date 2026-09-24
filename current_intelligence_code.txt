@@ -1,0 +1,3641 @@
+import os
+import sqlite3
+import asyncio
+from datetime import datetime, timezone
+
+import discord
+from discord.ext import commands
+from dotenv import load_dotenv
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+load_dotenv()
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+
+DATABASE_PATH = "data/intelligence.db"
+
+GUILD_ID = 1551362175459663934
+
+# During testing, only send 10 alerts per run.
+MAX_ALERTS_PER_RUN = 10
+
+
+# ============================================================
+# SEVERITY COLORS
+# ============================================================
+
+SEVERITY_COLORS = {
+
+    "BREAKING":
+        discord.Color.red(),
+
+    "HIGH":
+        discord.Color.orange(),
+
+    "MEDIUM":
+        discord.Color.gold(),
+
+    "LOW":
+        discord.Color.green(),
+
+}
+
+
+# ============================================================
+# DISCORD CHANNELS
+# ============================================================
+
+ALERT_CHANNELS = {
+
+    "BREAKING":
+        "breaking-news",
+
+    "HIGH":
+        "high-impact",
+
+    "MEDIUM":
+        "important-updates",
+
+    "LOW":
+        "news-updates",
+
+}
+
+
+# ============================================================
+# BOT
+# ============================================================
+
+intents = discord.Intents.default()
+
+intents.guilds = True
+
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+)
+
+
+# ============================================================
+# DATABASE CONNECTION
+# ============================================================
+
+def get_database_connection():
+
+    db = sqlite3.connect(
+        DATABASE_PATH
+    )
+
+    db.row_factory = sqlite3.Row
+
+    return db
+
+
+# ============================================================
+# DATABASE VERIFICATION
+# ============================================================
+
+def verify_database():
+
+    db = get_database_connection()
+
+    try:
+
+        tables = {
+            row[0]
+            for row in db.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type='table'
+                """
+            ).fetchall()
+        }
+
+        required_tables = [
+            "events",
+            "analyses",
+            "alerts",
+        ]
+
+        missing_tables = [
+            table
+            for table in required_tables
+            if table not in tables
+        ]
+
+        if missing_tables:
+
+            print(
+                "[ERROR] Missing database tables:"
+            )
+
+            for table in missing_tables:
+
+                print(
+                    f"  - {table}"
+                )
+
+            return False
+
+        # ----------------------------------------------------
+        # EVENTS SCHEMA
+        # ----------------------------------------------------
+
+        event_columns = {
+            row[1]
+            for row in db.execute(
+                "PRAGMA table_info(events)"
+            ).fetchall()
+        }
+
+        required_event_columns = {
+
+            "id",
+            "event_hash",
+            "headline",
+            "summary",
+            "category",
+            "subcategory",
+            "importance",
+            "confidence",
+            "first_seen",
+            "last_updated",
+            "status",
+
+        }
+
+        missing_event_columns = (
+            required_event_columns
+            - event_columns
+        )
+
+        if missing_event_columns:
+
+            print(
+                "[ERROR] Events table is missing:"
+            )
+
+            for column in sorted(
+                missing_event_columns
+            ):
+
+                print(
+                    f"  - {column}"
+                )
+
+            return False
+
+        # ----------------------------------------------------
+        # ALERTS SCHEMA
+        # ----------------------------------------------------
+
+        alert_columns = {
+            row[1]
+            for row in db.execute(
+                "PRAGMA table_info(alerts)"
+            ).fetchall()
+        }
+
+        required_alert_columns = {
+
+            "id",
+            "event_id",
+            "alert_type",
+            "channel_id",
+            "sent_at",
+            "severity",
+            "score",
+            "headline",
+            "reason",
+            "category",
+            "direction",
+            "status",
+
+        }
+
+        missing_alert_columns = (
+            required_alert_columns
+            - alert_columns
+        )
+
+        if missing_alert_columns:
+
+            print(
+                "[ERROR] Alerts table is missing:"
+            )
+
+            for column in sorted(
+                missing_alert_columns
+            ):
+
+                print(
+                    f"  - {column}"
+                )
+
+            return False
+
+        print(
+            "[SYSTEM] Database schema verified."
+        )
+
+        return True
+
+    finally:
+
+        db.close()
+
+
+# ============================================================
+# GUILD
+# ============================================================
+
+def get_guild():
+
+    return bot.get_guild(
+        GUILD_ID
+    )
+
+
+# ============================================================
+# CHANNEL NAME NORMALIZATION
+# ============================================================
+
+def normalize_channel_name(
+    name
+):
+
+    return (
+        name
+        .lower()
+        .replace("_", "-")
+        .replace(" ", "-")
+    )
+
+
+# ============================================================
+# FIND ALERT CATEGORY
+# ============================================================
+
+def find_alert_category(
+    guild
+):
+
+    for category in guild.categories:
+
+        name = normalize_channel_name(
+            category.name
+        )
+
+        if "alert" in name:
+
+            return category
+
+    return None
+
+
+# ============================================================
+# GET OR CREATE ALERT CHANNEL
+# ============================================================
+
+async def get_alert_channel(
+    guild,
+    severity
+):
+
+    desired_name = ALERT_CHANNELS.get(
+        severity,
+        "news-updates"
+    )
+
+    normalized_desired = (
+        normalize_channel_name(
+            desired_name
+        )
+    )
+
+    # --------------------------------------------------------
+    # Look for existing channel
+    # --------------------------------------------------------
+
+    for channel in guild.text_channels:
+
+        channel_name = (
+            normalize_channel_name(
+                channel.name
+            )
+        )
+
+        if channel_name == normalized_desired:
+
+            return channel
+
+    # --------------------------------------------------------
+    # Find existing alerts category
+    # --------------------------------------------------------
+
+    alerts_category = find_alert_category(
+        guild
+    )
+
+    # --------------------------------------------------------
+    # Create alerts category
+    # --------------------------------------------------------
+
+    if alerts_category is None:
+
+        alerts_category = (
+            await guild.create_category(
+                "🚨 ALERTS"
+            )
+        )
+
+        print(
+            "[DISCORD] Created category: "
+            "🚨 ALERTS"
+        )
+
+    # --------------------------------------------------------
+    # Create channel
+    # --------------------------------------------------------
+
+    channel = (
+        await guild.create_text_channel(
+            desired_name,
+            category=alerts_category,
+            topic=(
+                "ASNA Pakistan Intelligence "
+                f"{severity} alerts."
+            ),
+        )
+    )
+
+    print(
+        f"[DISCORD] Created channel: "
+        f"#{desired_name}"
+    )
+
+    return channel
+
+
+# ============================================================
+# SAFE ROW VALUE
+# ============================================================
+
+def safe_value(
+    row,
+    column,
+    default=""
+):
+
+    if row is None:
+
+        return default
+
+    try:
+
+        value = row[column]
+
+    except (
+        KeyError,
+        IndexError,
+    ):
+
+        return default
+
+    if value is None:
+
+        return default
+
+    value = str(value).strip()
+
+    if not value:
+
+        return default
+
+    return value
+
+
+# ============================================================
+# TEXT TRUNCATION
+# ============================================================
+
+def truncate(
+    text,
+    maximum
+):
+
+    if not text:
+
+        return ""
+
+    text = str(text)
+
+    if len(text) <= maximum:
+
+        return text
+
+    return (
+        text[:maximum - 3]
+        + "..."
+    )
+
+
+# ============================================================
+# GET PENDING ALERTS
+# ============================================================
+
+def get_pending_alerts():
+
+    db = get_database_connection()
+
+    try:
+
+        rows = db.execute(
+            """
+            SELECT
+
+                a.id AS alert_id,
+
+                a.event_id,
+
+                a.alert_type,
+
+                a.severity,
+
+                a.score,
+
+                a.headline AS alert_headline,
+
+                a.reason,
+
+                a.category AS alert_category,
+
+                a.direction,
+
+                a.channel_id,
+
+                a.sent_at,
+
+                a.status AS alert_status,
+
+                e.event_hash,
+
+                e.headline AS event_headline,
+
+                e.summary AS event_summary,
+
+                e.category AS event_category,
+
+                e.subcategory,
+
+                e.importance AS event_importance,
+
+                e.confidence AS event_confidence,
+
+                e.first_seen,
+
+                e.last_updated,
+
+                e.status AS event_status
+
+            FROM alerts a
+
+            INNER JOIN events e
+
+                ON e.id = a.event_id
+
+            WHERE
+
+                a.sent_at IS NULL
+
+            ORDER BY
+
+                CASE a.severity
+
+                    WHEN 'BREAKING' THEN 1
+
+                    WHEN 'HIGH' THEN 2
+
+                    WHEN 'MEDIUM' THEN 3
+
+                    WHEN 'LOW' THEN 4
+
+                    ELSE 5
+
+                END,
+
+                a.score DESC,
+
+                a.id ASC
+
+            LIMIT ?
+
+            """,
+            (
+                MAX_ALERTS_PER_RUN,
+            ),
+        ).fetchall()
+
+        return rows
+
+    finally:
+
+        db.close()
+
+
+# ============================================================
+# GET IMPACT ANALYSIS
+# ============================================================
+
+def get_analysis(
+    db,
+    event_id
+):
+
+    return db.execute(
+        """
+        SELECT *
+
+        FROM analyses
+
+        WHERE event_id = ?
+
+        ORDER BY id DESC
+
+        LIMIT 1
+        """,
+        (
+            event_id,
+        )
+    ).fetchone()
+
+
+# ============================================================
+# ADD IMPACT FIELD
+# ============================================================
+
+def add_impact_field(
+    embed,
+    title,
+    value
+):
+
+    if not value:
+
+        return
+
+    embed.add_field(
+
+        name=title,
+
+        value=truncate(
+            value,
+            1024
+        ),
+
+        inline=False,
+
+    )
+
+
+# ============================================================
+# BUILD DISCORD EMBED
+# ============================================================
+
+def build_embed(
+    alert,
+    event,
+    analysis
+):
+
+    severity = (
+        safe_value(
+            alert,
+            "severity",
+            "LOW"
+        )
+        .upper()
+    )
+
+    # --------------------------------------------------------
+    # Color
+    # --------------------------------------------------------
+
+    color = SEVERITY_COLORS.get(
+        severity,
+        discord.Color.blurple()
+    )
+
+    # --------------------------------------------------------
+    # Prefix
+    # --------------------------------------------------------
+
+    prefixes = {
+
+        "BREAKING":
+            "🚨 BREAKING",
+
+        "HIGH":
+            "🔴 HIGH IMPACT",
+
+        "MEDIUM":
+            "🟠 IMPORTANT",
+
+        "LOW":
+            "🟢 NEWS",
+
+    }
+
+    prefix = prefixes.get(
+        severity,
+        "📰 NEWS"
+    )
+
+    # --------------------------------------------------------
+    # Headline
+    # --------------------------------------------------------
+
+    headline = (
+        safe_value(
+            event,
+            "event_headline"
+        )
+        or safe_value(
+            alert,
+            "alert_headline"
+        )
+        or "Pakistan Intelligence Update"
+    )
+
+    headline = truncate(
+        headline,
+        230
+    )
+
+    # --------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------
+
+    summary = (
+        safe_value(
+            event,
+            "event_summary"
+        )
+        or safe_value(
+            alert,
+            "reason"
+        )
+        or "Pakistan intelligence update."
+    )
+
+    summary = truncate(
+        summary,
+        4000
+    )
+
+    # --------------------------------------------------------
+    # Create embed
+    # --------------------------------------------------------
+
+    embed = discord.Embed(
+
+        title=(
+            f"{prefix} | {headline}"
+        ),
+
+        description=summary,
+
+        color=color,
+
+        timestamp=datetime.now(
+            timezone.utc
+        ),
+
+    )
+
+    # ========================================================
+    # CATEGORY
+    # ========================================================
+
+    category = (
+        safe_value(
+            event,
+            "event_category"
+        )
+        or safe_value(
+            alert,
+            "alert_category"
+        )
+        or "general"
+    )
+
+    embed.add_field(
+
+        name="📌 Category",
+
+        value=(
+            category
+            .replace("_", " ")
+            .title()
+        ),
+
+        inline=True,
+
+    )
+
+    # ========================================================
+    # SUBCATEGORY
+    # ========================================================
+
+    subcategory = safe_value(
+        event,
+        "subcategory"
+    )
+
+    if subcategory:
+
+        embed.add_field(
+
+            name="🏷️ Subcategory",
+
+            value=(
+                subcategory
+                .replace("_", " ")
+                .title()
+            ),
+
+            inline=True,
+
+        )
+
+    # ========================================================
+    # DIRECTION
+    # ========================================================
+
+    direction = (
+        safe_value(
+            alert,
+            "direction"
+        )
+        or "neutral"
+    )
+
+    embed.add_field(
+
+        name="📊 Direction",
+
+        value=direction.title(),
+
+        inline=True,
+
+    )
+
+    # ========================================================
+    # INTELLIGENCE SCORE
+    # ========================================================
+
+    score = safe_value(
+        alert,
+        "score"
+    )
+
+    embed.add_field(
+
+        name="⚡ Intelligence Score",
+
+        value=(
+            f"{score}/100"
+            if score
+            else "N/A"
+        ),
+
+        inline=True,
+
+    )
+
+    # ========================================================
+    # EVENT IMPORTANCE
+    # ========================================================
+
+    importance = safe_value(
+        event,
+        "event_importance"
+    )
+
+    if importance:
+
+        embed.add_field(
+
+            name="🎯 Event Importance",
+
+            value=f"{importance}/5",
+
+            inline=True,
+
+        )
+
+    # ========================================================
+    # CONFIDENCE
+    # ========================================================
+
+    confidence = safe_value(
+        event,
+        "event_confidence"
+    )
+
+    if confidence:
+
+        try:
+
+            confidence_float = float(
+                confidence
+            )
+
+            if confidence_float <= 1:
+
+                confidence_display = (
+                    f"{confidence_float:.0%}"
+                )
+
+            else:
+
+                confidence_display = (
+                    f"{confidence_float:.0f}%"
+                )
+
+            embed.add_field(
+
+                name="🔎 Confidence",
+
+                value=confidence_display,
+
+                inline=True,
+
+            )
+
+        except ValueError:
+
+            pass
+
+    # ========================================================
+    # IMPACT ANALYSIS
+    # ========================================================
+
+    if analysis:
+
+        add_impact_field(
+            embed,
+            "💼 Business Impact",
+            safe_value(
+                analysis,
+                "business_impact"
+            )
+        )
+
+        add_impact_field(
+            embed,
+            "👥 Consumer Impact",
+            safe_value(
+                analysis,
+                "consumer_impact"
+            )
+        )
+
+        add_impact_field(
+            embed,
+            "🌐 Economic Impact",
+            safe_value(
+                analysis,
+                "economic_impact"
+            )
+        )
+
+        add_impact_field(
+            embed,
+            "📈 Market Impact",
+            safe_value(
+                analysis,
+                "market_impact"
+            )
+        )
+
+        add_impact_field(
+            embed,
+            "🏛️ Government Impact",
+            safe_value(
+                analysis,
+                "government_impact"
+            )
+        )
+
+        add_impact_field(
+            embed,
+            "💱 Currency Impact",
+            safe_value(
+                analysis,
+                "currency_impact"
+            )
+        )
+
+        add_impact_field(
+            embed,
+            "👷 Employment Impact",
+            safe_value(
+                analysis,
+                "employment_impact"
+            )
+        )
+
+        add_impact_field(
+            embed,
+            "🏦 Banking Impact",
+            safe_value(
+                analysis,
+                "banking_impact"
+            )
+        )
+
+    # ========================================================
+    # REASON
+    # ========================================================
+
+    reason = safe_value(
+        alert,
+        "reason"
+    )
+
+    if reason:
+
+        embed.add_field(
+
+            name="🧠 Classification Reason",
+
+            value=truncate(
+                reason,
+                1024
+            ),
+
+            inline=False,
+
+        )
+
+    # ========================================================
+    # TIMESTAMP
+    # ========================================================
+
+    last_updated = safe_value(
+        event,
+        "last_updated"
+    )
+
+    if last_updated:
+
+        embed.add_field(
+
+            name="🕐 Updated",
+
+            value=last_updated,
+
+            inline=False,
+
+        )
+
+    # ========================================================
+    # FOOTER
+    # ========================================================
+
+    embed.set_footer(
+
+        text=(
+            "ASNA Pakistan Intelligence • "
+            "Automated Intelligence System"
+        )
+
+    )
+
+    return embed
+
+
+# ============================================================
+# MARK ALERT SENT
+# ============================================================
+
+def mark_alert_sent(
+    alert_id,
+    channel_id
+):
+
+    db = get_database_connection()
+
+    try:
+
+        db.execute(
+            """
+            UPDATE alerts
+
+            SET
+
+                channel_id = ?,
+
+                sent_at = CURRENT_TIMESTAMP,
+
+                status = 'sent'
+
+            WHERE id = ?
+
+            """,
+            (
+                str(channel_id),
+                alert_id,
+            )
+        )
+
+        db.commit()
+
+    finally:
+
+        db.close()
+
+
+# ============================================================
+# MARK ALERT FAILED
+# ============================================================
+
+def mark_alert_failed(
+    alert_id
+):
+
+    db = get_database_connection()
+
+    try:
+
+        db.execute(
+            """
+            UPDATE alerts
+
+            SET status = 'failed'
+
+            WHERE id = ?
+
+            """,
+            (
+                alert_id,
+            )
+        )
+
+        db.commit()
+
+    finally:
+
+        db.close()
+
+
+# ============================================================
+# REPORT ALERTS
+# ============================================================
+
+async def report_alerts():
+
+    print()
+    print("=" * 70)
+    print("ASNA DISCORD INTELLIGENCE REPORTER")
+    print("=" * 70)
+
+    # --------------------------------------------------------
+    # Verify database
+    # --------------------------------------------------------
+
+    if not verify_database():
+
+        return
+
+    # --------------------------------------------------------
+    # Get guild
+    # --------------------------------------------------------
+
+    guild = get_guild()
+
+    if guild is None:
+
+        print(
+            "[ERROR] ASNA Consultancy server "
+            "was not found."
+        )
+
+        print(
+            f"Expected Guild ID: {GUILD_ID}"
+        )
+
+        return
+
+    print(
+        f"[DISCORD] Server: {guild.name}"
+    )
+
+    print(
+        f"[DISCORD] Server ID: {guild.id}"
+    )
+
+    # --------------------------------------------------------
+    # Get pending alerts
+    # --------------------------------------------------------
+
+    alerts = get_pending_alerts()
+
+    print()
+    print(
+        f"Pending alerts: {len(alerts)}"
+    )
+
+    if not alerts:
+
+        print(
+            "[DISCORD] No pending alerts."
+        )
+
+        return
+
+    db = get_database_connection()
+
+    sent = 0
+
+    errors = 0
+
+    # --------------------------------------------------------
+    # Process alerts
+    # --------------------------------------------------------
+
+    for index, alert in enumerate(
+        alerts,
+        start=1
+    ):
+
+        try:
+
+            severity = (
+                safe_value(
+                    alert,
+                    "severity",
+                    "LOW"
+                )
+                .upper()
+            )
+
+            # ------------------------------------------------
+            # Find / create channel
+            # ------------------------------------------------
+
+            channel = await get_alert_channel(
+                guild,
+                severity
+            )
+
+            # ------------------------------------------------
+            # Get impact analysis
+            # ------------------------------------------------
+
+            analysis = get_analysis(
+                db,
+                alert["event_id"]
+            )
+
+            # ------------------------------------------------
+            # Build event information
+            #
+            # This uses ONLY the real columns from your
+            # events table.
+            # ------------------------------------------------
+
+            event = {
+
+                "event_headline":
+                    safe_value(
+                        alert,
+                        "event_headline"
+                    ),
+
+                "event_summary":
+                    safe_value(
+                        alert,
+                        "event_summary"
+                    ),
+
+                "event_category":
+                    safe_value(
+                        alert,
+                        "event_category"
+                    ),
+
+                "subcategory":
+                    safe_value(
+                        alert,
+                        "subcategory"
+                    ),
+
+                "event_importance":
+                    safe_value(
+                        alert,
+                        "event_importance"
+                    ),
+
+                "event_confidence":
+                    safe_value(
+                        alert,
+                        "event_confidence"
+                    ),
+
+                "last_updated":
+                    safe_value(
+                        alert,
+                        "last_updated"
+                    ),
+
+            }
+
+            # ------------------------------------------------
+            # Build Discord embed
+            # ------------------------------------------------
+
+            embed = build_embed(
+
+                alert,
+
+                event,
+
+                analysis,
+
+            )
+
+            # ------------------------------------------------
+            # Send
+            # ------------------------------------------------
+
+            await channel.send(
+                embed=embed
+            )
+
+            # ------------------------------------------------
+            # Mark sent
+            # ------------------------------------------------
+
+            mark_alert_sent(
+
+                alert["alert_id"],
+
+                channel.id
+
+            )
+
+            sent += 1
+
+            # ------------------------------------------------
+            # Safe headline preview
+            # ------------------------------------------------
+
+            headline_preview = safe_value(
+                alert,
+                "event_headline"
+            )
+
+            headline_preview = truncate(
+                headline_preview,
+                65
+            )
+
+            print(
+                f"[{index}/{len(alerts)}] "
+                f"{severity:8} → "
+                f"#{channel.name} → "
+                f"{headline_preview}"
+            )
+
+            # ------------------------------------------------
+            # Small Discord delay
+            # ------------------------------------------------
+
+            await asyncio.sleep(
+                1
+            )
+
+        except Exception as error:
+
+            errors += 1
+
+            print(
+                f"[ERROR] Alert "
+                f"{alert['alert_id']}: "
+                f"{error}"
+            )
+
+            try:
+
+                mark_alert_failed(
+                    alert["alert_id"]
+                )
+
+            except Exception:
+
+                pass
+
+    db.close()
+
+    # ========================================================
+    # FINAL REPORT
+    # ========================================================
+
+    print()
+    print("=" * 70)
+    print("DISCORD REPORTING COMPLETE")
+    print("=" * 70)
+
+    print(
+        f"Alerts processed:   {len(alerts)}"
+    )
+
+    print(
+        f"Successfully sent:  {sent}"
+    )
+
+    print(
+        f"Errors:             {errors}"
+    )
+
+    print("=" * 70)
+
+
+# ============================================================
+# BOT READY
+# ============================================================
+
+@bot.event
+async def on_ready():
+
+    print()
+    print("=" * 70)
+    print("ASNA DISCORD REPORTER ONLINE")
+    print("=" * 70)
+
+    print(
+        f"Bot: {bot.user}"
+    )
+
+    print(
+        f"Guilds: {len(bot.guilds)}"
+    )
+
+    try:
+
+        await report_alerts()
+
+    except Exception as error:
+
+        print()
+        print(
+            "[FATAL] Reporter failed:"
+        )
+
+        print(
+            error
+        )
+
+    finally:
+
+        print()
+        print(
+            "[SYSTEM] Reporter finished."
+        )
+
+        await bot.close()
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    if not TOKEN:
+
+        print(
+            "[ERROR] DISCORD_TOKEN is missing "
+            "from .env"
+        )
+
+        return
+
+    print(
+        "[SYSTEM] Starting Discord Reporter..."
+    )
+
+    bot.run(
+        TOKEN
+    )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+
+    main()
+import sqlite3
+import re
+from collections import Counter
+
+DATABASE_PATH = "data/intelligence.db"
+
+
+# ============================================================
+# EVENT TYPES
+# ============================================================
+
+EVENT_RULES = {
+
+    "monetary_policy": [
+        "policy rate",
+        "interest rate",
+        "monetary policy",
+        "sbp rate",
+        "discount rate",
+        "rate cut",
+        "rate hike",
+        "rate unchanged",
+        "policy rate unchanged",
+    ],
+
+    "inflation": [
+        "inflation",
+        "cpi",
+        "consumer price",
+        "price increase",
+        "price hike",
+        "prices increased",
+        "inflation rate",
+    ],
+
+    "tax_policy": [
+        "fbr",
+        "income tax",
+        "sales tax",
+        "withholding tax",
+        "tax rate",
+        "tax collection",
+        "tax policy",
+        "tax amendment",
+        "customs duty",
+        "tax reform",
+    ],
+
+    "fiscal_policy": [
+        "budget",
+        "fiscal policy",
+        "government spending",
+        "public expenditure",
+        "revenue target",
+        "fiscal deficit",
+        "budget deficit",
+    ],
+
+    "energy": [
+        "electricity tariff",
+        "power tariff",
+        "gas tariff",
+        "petrol price",
+        "petrol prices",
+        "diesel price",
+        "oil price",
+        "lng",
+        "lpg",
+        "nepra",
+        "ogra",
+        "power generation",
+        "electricity price",
+    ],
+
+    "trade": [
+        "exports",
+        "export growth",
+        "imports",
+        "import growth",
+        "trade deficit",
+        "trade surplus",
+        "tariff",
+        "customs",
+        "trade agreement",
+        "trade policy",
+    ],
+
+    "investment": [
+        "investment",
+        "foreign investment",
+        "fdi",
+        "investor",
+        "investment agreement",
+        "investment deal",
+    ],
+
+    "market_movement": [
+        "psx",
+        "kse-100",
+        "kse 100",
+        "stock market",
+        "shares",
+        "stocks",
+        "index",
+        "market gained",
+        "market fell",
+        "market closed",
+        "trading session",
+    ],
+
+    "banking": [
+        "bank",
+        "banking",
+        "loan",
+        "lending",
+        "deposit",
+        "credit",
+        "banking policy",
+    ],
+
+    "corporate_action": [
+        "acquisition",
+        "merger",
+        "takeover",
+        "dividend",
+        "profit",
+        "loss",
+        "earnings",
+        "new plant",
+        "expansion",
+        "ceo",
+        "revenue",
+        "quarterly results",
+    ],
+
+    "imf": [
+        "imf",
+        "international monetary fund",
+        "extended fund facility",
+        "standby arrangement",
+        "staff level agreement",
+        "loan tranche",
+        "imf programme",
+        "imf program",
+    ],
+
+    "government_decision": [
+        "cabinet",
+        "government approved",
+        "government announces",
+        "ministry approved",
+        "notification",
+        "ordinance",
+        "regulation",
+        "policy approved",
+    ],
+
+}
+
+
+# ============================================================
+# ACTION RULES
+# ============================================================
+
+ACTION_RULES = {
+
+    "increase": [
+        "increase",
+        "increased",
+        "increase in",
+        "rise",
+        "rose",
+        "higher",
+        "hike",
+        "hiked",
+        "surge",
+        "surged",
+        "jump",
+        "jumped",
+        "grew",
+        "growth",
+    ],
+
+    "decrease": [
+        "decrease",
+        "decreased",
+        "decline",
+        "declined",
+        "fall",
+        "fell",
+        "lower",
+        "cut",
+        "cutting",
+        "reduction",
+        "reduced",
+        "drop",
+        "dropped",
+        "slump",
+    ],
+
+    "approval": [
+        "approved",
+        "approval",
+        "allowed",
+        "cleared",
+        "endorsed",
+        "sanctioned",
+    ],
+
+    "announcement": [
+        "announced",
+        "announces",
+        "announcing",
+        "notified",
+        "notification",
+        "revealed",
+        "introduced",
+        "unveiled",
+    ],
+
+    "agreement": [
+        "agreement",
+        "agreed",
+        "deal",
+        "accord",
+        "pact",
+        "signed",
+        "signing",
+    ],
+
+    "unchanged": [
+        "unchanged",
+        "maintained",
+        "kept unchanged",
+        "no change",
+        "left unchanged",
+        "remained unchanged",
+    ],
+
+    "rejection": [
+        "rejected",
+        "rejection",
+        "denied",
+        "refused",
+        "blocked",
+    ],
+
+}
+
+
+# ============================================================
+# SECTOR RULES
+# ============================================================
+
+SECTOR_RULES = {
+
+    "banking": [
+        "bank",
+        "banking",
+        "loan",
+        "credit",
+        "deposit",
+        "sbp",
+        "interest rate",
+    ],
+
+    "energy": [
+        "oil",
+        "gas",
+        "petrol",
+        "diesel",
+        "electricity",
+        "power",
+        "lng",
+        "lpg",
+        "nepra",
+        "ogra",
+    ],
+
+    "manufacturing": [
+        "factory",
+        "manufacturing",
+        "cement",
+        "textile",
+        "steel",
+        "automobile",
+        "industry",
+        "industrial",
+    ],
+
+    "technology": [
+        "technology",
+        "software",
+        "digital",
+        "ai",
+        "artificial intelligence",
+        "fintech",
+        "telecom",
+        "5g",
+    ],
+
+    "retail": [
+        "retail",
+        "consumer",
+        "shopping",
+        "sales",
+        "stores",
+        "supermarket",
+    ],
+
+    "real_estate": [
+        "property",
+        "real estate",
+        "housing",
+        "construction",
+        "housing scheme",
+    ],
+
+    "agriculture": [
+        "agriculture",
+        "farmer",
+        "crop",
+        "wheat",
+        "rice",
+        "cotton",
+        "fertilizer",
+        "livestock",
+    ],
+
+    "trade": [
+        "export",
+        "import",
+        "customs",
+        "trade",
+        "shipment",
+        "tariff",
+    ],
+
+    "markets": [
+        "psx",
+        "stock",
+        "stocks",
+        "shares",
+        "kse",
+        "equity",
+        "index",
+    ],
+
+    "government": [
+        "government",
+        "ministry",
+        "cabinet",
+        "fbr",
+        "policy",
+        "regulation",
+        "notification",
+    ],
+
+}
+
+
+# ============================================================
+# ENTITY RULES
+# ============================================================
+
+ENTITY_RULES = {
+
+    "State Bank of Pakistan": [
+        "sbp",
+        "state bank of pakistan",
+    ],
+
+    "Federal Board of Revenue": [
+        "fbr",
+        "federal board of revenue",
+    ],
+
+    "Pakistan Stock Exchange": [
+        "psx",
+        "pakistan stock exchange",
+        "kse-100",
+        "kse 100",
+    ],
+
+    "IMF": [
+        "imf",
+        "international monetary fund",
+    ],
+
+    "NEPRA": [
+        "nepra",
+        "national electric power regulatory authority",
+    ],
+
+    "OGRA": [
+        "ogra",
+        "oil and gas regulatory authority",
+    ],
+
+    "Government of Pakistan": [
+        "government of pakistan",
+        "federal government",
+        "government",
+    ],
+
+    "Ministry of Finance": [
+        "ministry of finance",
+        "finance ministry",
+    ],
+
+    "Ministry of Commerce": [
+        "ministry of commerce",
+        "commerce ministry",
+    ],
+
+}
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def normalize(text):
+
+    if not text:
+        return ""
+
+    text = str(text).lower()
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
+    return text.strip()
+
+
+def detect_from_rules(text, rules):
+
+    scores = Counter()
+
+    for label, keywords in rules.items():
+
+        for keyword in keywords:
+
+            keyword = keyword.lower()
+
+            if keyword in text:
+
+                # Longer phrases receive more weight.
+                scores[label] += max(
+                    1,
+                    len(keyword.split())
+                )
+
+    if not scores:
+        return "general"
+
+    return scores.most_common(1)[0][0]
+
+
+def detect_entity(text):
+
+    scores = Counter()
+
+    for entity, keywords in ENTITY_RULES.items():
+
+        for keyword in keywords:
+
+            if keyword.lower() in text:
+
+                scores[entity] += max(
+                    1,
+                    len(keyword.split())
+                )
+
+    if not scores:
+        return "Pakistan"
+
+    return scores.most_common(1)[0][0]
+
+
+def detect_importance(text):
+
+    high_terms = [
+        "imf",
+        "default",
+        "policy rate",
+        "interest rate",
+        "fbr",
+        "sbp",
+        "inflation",
+        "petrol price",
+        "electricity tariff",
+        "tax rate",
+        "devaluation",
+        "rupee",
+        "psx crash",
+        "market crash",
+        "budget",
+        "fiscal deficit",
+    ]
+
+    medium_terms = [
+        "investment",
+        "exports",
+        "imports",
+        "profit",
+        "banking",
+        "energy",
+        "trade",
+        "stock market",
+        "dividend",
+        "earnings",
+    ]
+
+    high = sum(
+        1
+        for keyword in high_terms
+        if keyword in text
+    )
+
+    medium = sum(
+        1
+        for keyword in medium_terms
+        if keyword in text
+    )
+
+    if high >= 2:
+        return 5
+
+    if high == 1:
+        return 4
+
+    if medium >= 2:
+        return 3
+
+    if medium == 1:
+        return 2
+
+    return 1
+
+
+def detect_direction(event_type, action):
+
+    if action == "unchanged":
+        return "neutral"
+
+    if action == "rejection":
+        return "negative"
+
+    if action in (
+        "approval",
+        "agreement",
+    ):
+        return "positive"
+
+    # Price increases are generally negative
+    # for consumers/business cost bases.
+    if event_type in (
+        "inflation",
+        "energy",
+        "tax_policy",
+    ):
+
+        if action == "increase":
+            return "negative"
+
+        if action == "decrease":
+            return "positive"
+
+    # Export growth and investment growth
+    # are generally positive at the macro level.
+    if event_type in (
+        "trade",
+        "investment",
+    ):
+
+        if action == "increase":
+            return "positive"
+
+        if action == "decrease":
+            return "negative"
+
+    # Market movement remains contextual.
+    if event_type == "market_movement":
+
+        if action == "increase":
+            return "positive"
+
+        if action == "decrease":
+            return "negative"
+
+    return "neutral"
+
+
+# ============================================================
+# BUILD EVENT
+# ============================================================
+
+def build_event(row):
+
+    title = row["title"] or ""
+
+    description = row["description"] or ""
+
+    content = row["content"] or ""
+
+    text = normalize(
+        f"{title} {description} {content}"
+    )
+
+    event_type = detect_from_rules(
+        text,
+        EVENT_RULES
+    )
+
+    action = detect_from_rules(
+        text,
+        ACTION_RULES
+    )
+
+    sector = detect_from_rules(
+        text,
+        SECTOR_RULES
+    )
+
+    entity = detect_entity(text)
+
+    importance = detect_importance(text)
+
+    direction = detect_direction(
+        event_type,
+        action
+    )
+
+    return {
+
+        "article_id": row["id"],
+
+        "headline": title,
+
+        "event_type": event_type,
+
+        "action": action,
+
+        "entity": entity,
+
+        "sector": sector,
+
+        "direction": direction,
+
+        "importance": importance,
+
+        "location": "Pakistan",
+
+        "description": description,
+
+    }
+
+
+# ============================================================
+# DATABASE HELPERS
+# ============================================================
+
+def get_columns(db, table):
+
+    rows = db.execute(
+        f"PRAGMA table_info({table})"
+    ).fetchall()
+
+    return [
+        row[1]
+        for row in rows
+    ]
+
+
+def find_column(
+    columns,
+    possible_names
+):
+
+    for name in possible_names:
+
+        if name in columns:
+            return name
+
+    return None
+
+
+# ============================================================
+# INSERT EVENT
+# ============================================================
+
+def insert_event(
+    db,
+    event,
+    columns
+):
+
+    mapping = {
+
+        "article_id": [
+            "article_id",
+            "source_article_id",
+            "article",
+            "article_id_fk",
+        ],
+
+        "headline": [
+            "headline",
+            "title",
+            "name",
+            "event_title",
+        ],
+
+        "event_type": [
+            "event_type",
+            "type",
+            "category",
+        ],
+
+        "action": [
+            "action",
+            "event_action",
+        ],
+
+        "entity": [
+            "entity",
+            "entity_name",
+            "organization",
+            "company",
+        ],
+
+        "sector": [
+            "sector",
+        ],
+
+        "direction": [
+            "direction",
+            "impact_direction",
+        ],
+
+        "importance": [
+            "importance",
+            "importance_score",
+            "priority",
+        ],
+
+        "location": [
+            "location",
+        ],
+
+        "description": [
+            "description",
+            "summary",
+            "details",
+            "event_description",
+        ],
+    }
+
+    insert_columns = []
+
+    values = []
+
+    for event_key, possible_names in mapping.items():
+
+        actual_column = find_column(
+            columns,
+            possible_names
+        )
+
+        if actual_column:
+
+            insert_columns.append(
+                actual_column
+            )
+
+            values.append(
+                event[event_key]
+            )
+
+    # --------------------------------------------------------
+    # Handle common required fields that may not be in mapping
+    # --------------------------------------------------------
+
+    # If the table has a required headline, make absolutely
+    # sure it gets populated.
+    if (
+        "headline" in columns
+        and "headline" not in insert_columns
+    ):
+
+        insert_columns.append("headline")
+        values.append(event["headline"])
+
+    # If event_type exists and wasn't mapped.
+    if (
+        "event_type" in columns
+        and "event_type" not in insert_columns
+    ):
+
+        insert_columns.append("event_type")
+        values.append(event["event_type"])
+
+    if not insert_columns:
+
+        raise RuntimeError(
+            "No compatible event columns found."
+        )
+
+    placeholders = ", ".join(
+        ["?"] * len(values)
+    )
+
+    sql = f"""
+        INSERT INTO events
+        ({", ".join(insert_columns)})
+        VALUES ({placeholders})
+    """
+
+    db.execute(
+        sql,
+        values
+    )
+
+
+# ============================================================
+# DUPLICATE CHECK
+# ============================================================
+
+def event_already_exists(
+    db,
+    article_id,
+    columns
+):
+
+    article_column = find_column(
+        columns,
+        [
+            "article_id",
+            "source_article_id",
+            "article",
+            "article_id_fk",
+        ]
+    )
+
+    if article_column:
+
+        row = db.execute(
+            f"""
+            SELECT 1
+            FROM events
+            WHERE {article_column} = ?
+            LIMIT 1
+            """,
+            (article_id,),
+        ).fetchone()
+
+        return row is not None
+
+    # If there is no article relationship column,
+    # use headline as a secondary duplicate check.
+    if "headline" in columns:
+
+        row = db.execute(
+            """
+            SELECT 1
+            FROM events
+            WHERE headline = ?
+            LIMIT 1
+            """,
+            (
+                "PLACEHOLDER",
+            ),
+        ).fetchone()
+
+        # No reliable article mapping exists,
+        # so don't incorrectly skip events.
+        return False
+
+    return False
+
+
+# ============================================================
+# MAIN ENGINE
+# ============================================================
+
+def run_event_engine():
+
+    db = sqlite3.connect(
+        DATABASE_PATH
+    )
+
+    db.row_factory = sqlite3.Row
+
+    print()
+    print("=" * 70)
+    print("ASNA EVENT EXTRACTION ENGINE")
+    print("=" * 70)
+
+    # --------------------------------------------------------
+    # Verify tables
+    # --------------------------------------------------------
+
+    tables = [
+        row[0]
+        for row in db.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type='table'
+            """
+        ).fetchall()
+    ]
+
+    if "events" not in tables:
+
+        print(
+            "[ERROR] events table does not exist."
+        )
+
+        db.close()
+        return
+
+    if "articles" not in tables:
+
+        print(
+            "[ERROR] articles table does not exist."
+        )
+
+        db.close()
+        return
+
+    # --------------------------------------------------------
+    # Inspect events schema
+    # --------------------------------------------------------
+
+    event_columns = get_columns(
+        db,
+        "events"
+    )
+
+    print()
+    print("EVENT TABLE COLUMNS")
+
+    for column in event_columns:
+
+        print(
+            f"  - {column}"
+        )
+
+    # --------------------------------------------------------
+    # Load classified articles
+    # --------------------------------------------------------
+
+    articles = db.execute(
+        """
+        SELECT
+            id,
+            title,
+            description,
+            content,
+            category,
+            subcategory
+        FROM articles
+        WHERE processed = 1
+        ORDER BY id ASC
+        """
+    ).fetchall()
+
+    print()
+    print(
+        f"Classified articles found: "
+        f"{len(articles)}"
+    )
+
+    if not articles:
+
+        print(
+            "[INFO] No classified articles found."
+        )
+
+        db.close()
+        return
+
+    created = 0
+
+    skipped = 0
+
+    errors = 0
+
+    event_counter = Counter()
+
+    sector_counter = Counter()
+
+    direction_counter = Counter()
+
+    # --------------------------------------------------------
+    # Process articles
+    # --------------------------------------------------------
+
+    for index, article in enumerate(
+        articles,
+        start=1
+    ):
+
+        if event_already_exists(
+            db,
+            article["id"],
+            event_columns
+        ):
+
+            skipped += 1
+
+            continue
+
+        event = build_event(
+            article
+        )
+
+        try:
+
+            insert_event(
+                db,
+                event,
+                event_columns
+            )
+
+            created += 1
+
+            event_counter[
+                event["event_type"]
+            ] += 1
+
+            sector_counter[
+                event["sector"]
+            ] += 1
+
+            direction_counter[
+                event["direction"]
+            ] += 1
+
+            print(
+                f"[{index}/{len(articles)}] "
+                f"{event['event_type']:22} | "
+                f"{event['sector']:16} | "
+                f"{event['direction']:20} | "
+                f"Imp {event['importance']} | "
+                f"{event['headline'][:55]}"
+            )
+
+        except Exception as error:
+
+            errors += 1
+
+            print(
+                f"[ERROR] Article "
+                f"{article['id']}: "
+                f"{error}"
+            )
+
+    # --------------------------------------------------------
+    # Commit
+    # --------------------------------------------------------
+
+    db.commit()
+
+    # --------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------
+
+    print()
+    print("=" * 70)
+    print("EVENT EXTRACTION COMPLETE")
+    print("=" * 70)
+
+    print(
+        f"Events created:       {created}"
+    )
+
+    print(
+        f"Already existing:     {skipped}"
+    )
+
+    print(
+        f"Errors:               {errors}"
+    )
+
+    print()
+    print("EVENT TYPES")
+
+    if event_counter:
+
+        for event_type, count in (
+            event_counter.most_common()
+        ):
+
+            print(
+                f"{event_type:30} {count}"
+            )
+
+    else:
+
+        print("No new events.")
+
+    print()
+    print("SECTORS")
+
+    if sector_counter:
+
+        for sector, count in (
+            sector_counter.most_common()
+        ):
+
+            print(
+                f"{sector:30} {count}"
+            )
+
+    else:
+
+        print("No new sectors.")
+
+    print()
+    print("DIRECTION")
+
+    if direction_counter:
+
+        for direction, count in (
+            direction_counter.most_common()
+        ):
+
+            print(
+                f"{direction:30} {count}"
+            )
+
+    print()
+    print("=" * 70)
+
+    db.close()
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+if __name__ == "__main__":
+
+    run_event_engine()
+import sqlite3
+import re
+from datetime import datetime
+from collections import Counter
+
+
+DATABASE_PATH = "data/intelligence.db"
+
+
+# ============================================================
+# SCORE THRESHOLDS
+# ============================================================
+
+BREAKING_SCORE = 80
+HIGH_SCORE = 60
+MEDIUM_SCORE = 35
+
+
+# ============================================================
+# CRITICAL KEYWORDS
+# ============================================================
+
+CRITICAL_KEYWORDS = {
+
+    "imf": 25,
+    "default": 30,
+    "devaluation": 25,
+    "currency crisis": 30,
+    "financial crisis": 30,
+    "emergency": 20,
+
+    "policy rate": 20,
+    "interest rate": 20,
+
+    "sbp": 15,
+    "fbr": 15,
+
+    "tax reform": 15,
+    "budget": 15,
+
+    "petrol price": 18,
+    "electricity tariff": 18,
+    "gas tariff": 18,
+
+    "psx crash": 30,
+    "market crash": 30,
+
+    "sanctions": 25,
+    "war": 30,
+
+    "major agreement": 20,
+}
+
+
+# ============================================================
+# IMPORTANT KEYWORDS
+# ============================================================
+
+IMPORTANT_KEYWORDS = {
+
+    "inflation": 12,
+    "exports": 10,
+    "imports": 10,
+
+    "investment": 10,
+    "foreign investment": 15,
+
+    "trade deficit": 15,
+    "trade surplus": 12,
+
+    "profit": 7,
+    "earnings": 7,
+
+    "banking": 8,
+    "energy": 8,
+
+    "oil": 8,
+    "gas": 8,
+
+    "stock market": 10,
+    "kse-100": 12,
+    "kse 100": 12,
+    "psx": 12,
+
+    "tax": 10,
+    "loan": 7,
+    "interest": 10,
+}
+
+
+# ============================================================
+# EVENT TYPE WEIGHTS
+# ============================================================
+
+EVENT_WEIGHTS = {
+
+    "imf": 20,
+    "monetary_policy": 20,
+    "tax_policy": 18,
+    "fiscal_policy": 18,
+
+    "energy": 15,
+    "inflation": 15,
+    "market_movement": 15,
+
+    "trade": 12,
+    "investment": 12,
+    "banking": 12,
+
+    "corporate_action": 8,
+    "government_decision": 10,
+
+    "general": 0,
+}
+
+
+# ============================================================
+# OFFICIAL ENTITIES
+# ============================================================
+
+OFFICIAL_ENTITIES = {
+
+    "state bank of pakistan",
+    "sbp",
+
+    "federal board of revenue",
+    "fbr",
+
+    "pakistan stock exchange",
+    "psx",
+
+    "nepra",
+    "ogra",
+    "securities and exchange commission",
+    "secp",
+
+    "ministry of finance",
+    "ministry of commerce",
+
+    "government of pakistan",
+    "cabinet",
+}
+
+
+# ============================================================
+# DATABASE SETUP / MIGRATION
+# ============================================================
+
+def ensure_alerts_table(db):
+
+    # --------------------------------------------------------
+    # Create the original table if it does not exist
+    # --------------------------------------------------------
+
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS alerts (
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            event_id INTEGER,
+
+            alert_type TEXT,
+
+            channel_id TEXT,
+
+            sent_at TIMESTAMP
+
+        )
+        """
+    )
+
+    db.commit()
+
+    # --------------------------------------------------------
+    # Read existing columns
+    # --------------------------------------------------------
+
+    rows = db.execute(
+        "PRAGMA table_info(alerts)"
+    ).fetchall()
+
+    existing_columns = {
+        row[1]
+        for row in rows
+    }
+
+    # --------------------------------------------------------
+    # Additional intelligence columns
+    # --------------------------------------------------------
+
+    migrations = {
+
+        "severity":
+            "ALTER TABLE alerts ADD COLUMN severity TEXT",
+
+        "score":
+            "ALTER TABLE alerts ADD COLUMN score INTEGER DEFAULT 0",
+
+        "headline":
+            "ALTER TABLE alerts ADD COLUMN headline TEXT",
+
+        "reason":
+            "ALTER TABLE alerts ADD COLUMN reason TEXT",
+
+        "category":
+            "ALTER TABLE alerts ADD COLUMN category TEXT",
+
+        "direction":
+            "ALTER TABLE alerts ADD COLUMN direction TEXT",
+
+        "published_at":
+            "ALTER TABLE alerts ADD COLUMN published_at TEXT",
+
+        "status":
+            "ALTER TABLE alerts ADD COLUMN status TEXT DEFAULT 'pending'",
+
+        "created_at":
+            "ALTER TABLE alerts ADD COLUMN created_at TIMESTAMP",
+
+    }
+
+    # --------------------------------------------------------
+    # Apply missing columns
+    # --------------------------------------------------------
+
+    added = 0
+
+    for column, sql in migrations.items():
+
+        if column not in existing_columns:
+
+            db.execute(sql)
+
+            added += 1
+
+            print(
+                f"[SYSTEM] Added alerts column: {column}"
+            )
+
+    db.commit()
+
+    if added:
+
+        print(
+            f"[SYSTEM] Alerts schema upgraded: "
+            f"{added} columns added."
+        )
+
+    else:
+
+        print(
+            "[SYSTEM] Alerts schema already up to date."
+        )
+
+
+# ============================================================
+# TEXT NORMALIZATION
+# ============================================================
+
+def normalize(text):
+
+    if not text:
+
+        return ""
+
+    text = str(text).lower()
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
+    return text.strip()
+
+
+# ============================================================
+# KEYWORD SCORING
+# ============================================================
+
+def keyword_score(text):
+
+    score = 0
+
+    matched = []
+
+    for keyword, weight in (
+        CRITICAL_KEYWORDS.items()
+    ):
+
+        if keyword in text:
+
+            score += weight
+
+            matched.append(
+                keyword
+            )
+
+    for keyword, weight in (
+        IMPORTANT_KEYWORDS.items()
+    ):
+
+        if keyword in text:
+
+            score += weight
+
+            matched.append(
+                keyword
+            )
+
+    return score, matched
+
+
+# ============================================================
+# EVENT TYPE SCORE
+# ============================================================
+
+def event_type_score(event_type):
+
+    return EVENT_WEIGHTS.get(
+        event_type,
+        0
+    )
+
+
+# ============================================================
+# IMPORTANCE SCORE
+# ============================================================
+
+def importance_score(importance):
+
+    try:
+
+        importance = int(
+            importance
+        )
+
+    except Exception:
+
+        importance = 1
+
+    return importance * 10
+
+
+# ============================================================
+# OFFICIAL ENTITY SCORE
+# ============================================================
+
+def official_entity_score(text):
+
+    for entity in OFFICIAL_ENTITIES:
+
+        if entity in text:
+
+            return 15
+
+    return 0
+
+
+# ============================================================
+# SEVERITY
+# ============================================================
+
+def severity_from_score(score):
+
+    if score >= BREAKING_SCORE:
+
+        return "BREAKING"
+
+    if score >= HIGH_SCORE:
+
+        return "HIGH"
+
+    if score >= MEDIUM_SCORE:
+
+        return "MEDIUM"
+
+    return "LOW"
+
+
+# ============================================================
+# BUILD ALERT
+# ============================================================
+
+def build_alert(
+    event,
+    analysis
+):
+
+    # --------------------------------------------------------
+    # Headline
+    # --------------------------------------------------------
+
+    headline = ""
+
+    if (
+        "headline" in event.keys()
+        and event["headline"]
+    ):
+
+        headline = event["headline"]
+
+    elif (
+        "title" in event.keys()
+        and event["title"]
+    ):
+
+        headline = event["title"]
+
+    # --------------------------------------------------------
+    # Event type
+    # --------------------------------------------------------
+
+    event_type = (
+
+        event["event_type"]
+
+        if (
+            "event_type" in event.keys()
+            and event["event_type"]
+        )
+
+        else "general"
+    )
+
+    # --------------------------------------------------------
+    # Direction
+    # --------------------------------------------------------
+
+    direction = (
+
+        analysis["direction"]
+
+        if (
+            "direction" in analysis.keys()
+            and analysis["direction"]
+        )
+
+        else "neutral"
+    )
+
+    # --------------------------------------------------------
+    # Combine event text
+    # --------------------------------------------------------
+
+    values = []
+
+    for key in event.keys():
+
+        value = event[key]
+
+        if value is not None:
+
+            values.append(
+                str(value)
+            )
+
+    combined_text = normalize(
+        " ".join(values)
+    )
+
+    # --------------------------------------------------------
+    # Base score
+    # --------------------------------------------------------
+
+    score = 0
+
+    reasons = []
+
+    # --------------------------------------------------------
+    # Keyword score
+    # --------------------------------------------------------
+
+    keyword_points, matched = keyword_score(
+        combined_text
+    )
+
+    score += keyword_points
+
+    if matched:
+
+        reasons.append(
+            "High-impact terms: "
+            + ", ".join(
+                matched[:8]
+            )
+        )
+
+    # --------------------------------------------------------
+    # Event type
+    # --------------------------------------------------------
+
+    event_points = event_type_score(
+        event_type
+    )
+
+    score += event_points
+
+    if event_points:
+
+        reasons.append(
+            f"Event type: {event_type}"
+        )
+
+    # --------------------------------------------------------
+    # Analytical importance
+    # --------------------------------------------------------
+
+    importance = (
+
+        analysis["importance"]
+
+        if (
+            "importance" in analysis.keys()
+            and analysis["importance"]
+        )
+
+        else 1
+    )
+
+    importance_points = importance_score(
+        importance
+    )
+
+    score += importance_points
+
+    if importance >= 4:
+
+        reasons.append(
+            f"High analytical importance: "
+            f"{importance}/5"
+        )
+
+    # --------------------------------------------------------
+    # Official entity
+    # --------------------------------------------------------
+
+    official_points = official_entity_score(
+        combined_text
+    )
+
+    score += official_points
+
+    if official_points:
+
+        reasons.append(
+            "Official institution involved"
+        )
+
+    # --------------------------------------------------------
+    # Direction
+    # --------------------------------------------------------
+
+    if direction in (
+        "positive",
+        "negative",
+    ):
+
+        score += 5
+
+        reasons.append(
+            f"Detected direction: {direction}"
+        )
+
+    # --------------------------------------------------------
+    # Cap
+    # --------------------------------------------------------
+
+    score = min(
+        score,
+        100
+    )
+
+    # --------------------------------------------------------
+    # Severity
+    # --------------------------------------------------------
+
+    severity = severity_from_score(
+        score
+    )
+
+    # --------------------------------------------------------
+    # Alert type
+    # --------------------------------------------------------
+
+    if severity == "BREAKING":
+
+        alert_type = "breaking_news"
+
+    elif severity == "HIGH":
+
+        alert_type = "high_importance"
+
+    elif severity == "MEDIUM":
+
+        alert_type = "important_news"
+
+    else:
+
+        alert_type = "news"
+
+    # --------------------------------------------------------
+    # Reason
+    # --------------------------------------------------------
+
+    reason = "; ".join(
+        reasons
+    )
+
+    if not reason:
+
+        reason = (
+            "Classified using the "
+            "ASNA importance engine."
+        )
+
+    # --------------------------------------------------------
+    # Published date
+    # --------------------------------------------------------
+
+    published_at = None
+
+    if "published_at" in event.keys():
+
+        published_at = (
+            event["published_at"]
+        )
+
+    return {
+
+        "event_id":
+            event["id"],
+
+        "alert_type":
+            alert_type,
+
+        "severity":
+            severity,
+
+        "score":
+            score,
+
+        "headline":
+            headline,
+
+        "reason":
+            reason,
+
+        "category":
+            event_type,
+
+        "direction":
+            direction,
+
+        "published_at":
+            published_at,
+
+    }
+
+
+# ============================================================
+# DUPLICATE CHECK
+# ============================================================
+
+def alert_exists(
+    db,
+    event_id
+):
+
+    row = db.execute(
+        """
+        SELECT id
+        FROM alerts
+        WHERE event_id = ?
+        LIMIT 1
+        """,
+        (
+            event_id,
+        )
+    ).fetchone()
+
+    return row is not None
+
+
+# ============================================================
+# SAVE ALERT
+# ============================================================
+
+def save_alert(
+    db,
+    alert
+):
+
+    db.execute(
+        """
+        INSERT INTO alerts (
+
+            event_id,
+            alert_type,
+            severity,
+            score,
+            headline,
+            reason,
+            category,
+            direction,
+            published_at,
+            status,
+            created_at
+
+        )
+
+        VALUES (
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?
+        )
+        """,
+        (
+
+            alert["event_id"],
+
+            alert["alert_type"],
+
+            alert["severity"],
+
+            alert["score"],
+
+            alert["headline"],
+
+            alert["reason"],
+
+            alert["category"],
+
+            alert["direction"],
+
+            alert["published_at"],
+
+            "pending",
+
+            datetime.now().isoformat(
+                timespec="seconds"
+            ),
+
+        )
+    )
+
+
+# ============================================================
+# MAIN ENGINE
+# ============================================================
+
+def run_alert_engine():
+
+    db = sqlite3.connect(
+        DATABASE_PATH
+    )
+
+    db.row_factory = sqlite3.Row
+
+    print()
+    print("=" * 70)
+    print("ASNA IMPORTANCE & BREAKING NEWS ENGINE")
+    print("=" * 70)
+
+    # --------------------------------------------------------
+    # Verify events table
+    # --------------------------------------------------------
+
+    tables = {
+        row[0]
+        for row in db.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type='table'
+            """
+        ).fetchall()
+    }
+
+    if "events" not in tables:
+
+        print(
+            "[ERROR] events table does not exist."
+        )
+
+        print(
+            "Run:"
+        )
+
+        print(
+            "python news/event_engine.py"
+        )
+
+        db.close()
+
+        return
+
+    # --------------------------------------------------------
+    # Verify analyses table
+    # --------------------------------------------------------
+
+    if "analyses" not in tables:
+
+        print(
+            "[ERROR] analyses table does not exist."
+        )
+
+        print(
+            "Run:"
+        )
+
+        print(
+            "python news/impact_engine.py"
+        )
+
+        db.close()
+
+        return
+
+    # --------------------------------------------------------
+    # Upgrade alerts table
+    # --------------------------------------------------------
+
+    ensure_alerts_table(
+        db
+    )
+
+    # --------------------------------------------------------
+    # Load events + analysis
+    # --------------------------------------------------------
+
+    events = db.execute(
+        """
+        SELECT
+            e.*,
+
+            a.direction AS analysis_direction,
+
+            a.importance AS analysis_importance,
+
+            a.confidence AS analysis_confidence
+
+        FROM events e
+
+        LEFT JOIN analyses a
+            ON a.event_id = e.id
+
+        ORDER BY e.id ASC
+        """
+    ).fetchall()
+
+    print()
+    print(
+        f"Events found: {len(events)}"
+    )
+
+    if not events:
+
+        print(
+            "[INFO] No events available."
+        )
+
+        db.close()
+
+        return
+
+    # --------------------------------------------------------
+    # Counters
+    # --------------------------------------------------------
+
+    created = 0
+
+    skipped = 0
+
+    errors = 0
+
+    severity_counter = Counter()
+
+    type_counter = Counter()
+
+    # --------------------------------------------------------
+    # Process events
+    # --------------------------------------------------------
+
+    for index, event in enumerate(
+        events,
+        start=1
+    ):
+
+        # ----------------------------------------------------
+        # Duplicate check
+        # ----------------------------------------------------
+
+        if alert_exists(
+            db,
+            event["id"]
+        ):
+
+            skipped += 1
+
+            continue
+
+        # ----------------------------------------------------
+        # Analysis data
+        # ----------------------------------------------------
+
+        analysis = {
+
+            "direction":
+                event["analysis_direction"]
+                or "neutral",
+
+            "importance":
+                event["analysis_importance"]
+                or 1,
+
+        }
+
+        try:
+
+            alert = build_alert(
+                event,
+                analysis
+            )
+
+            save_alert(
+                db,
+                alert
+            )
+
+            created += 1
+
+            severity_counter[
+                alert["severity"]
+            ] += 1
+
+            type_counter[
+                alert["alert_type"]
+            ] += 1
+
+            print(
+                f"[{index}/{len(events)}] "
+                f"{alert['severity']:8} | "
+                f"{alert['score']:3}/100 | "
+                f"{alert['category']:22} | "
+                f"{alert['headline'][:55]}"
+            )
+
+        except Exception as error:
+
+            errors += 1
+
+            print(
+                f"[ERROR] Event "
+                f"{event['id']}: "
+                f"{error}"
+            )
+
+    # --------------------------------------------------------
+    # Commit
+    # --------------------------------------------------------
+
+    db.commit()
+
+    # --------------------------------------------------------
+    # Final report
+    # --------------------------------------------------------
+
+    print()
+    print("=" * 70)
+    print("IMPORTANCE ENGINE COMPLETE")
+    print("=" * 70)
+
+    print(
+        f"Alerts created:       {created}"
+    )
+
+    print(
+        f"Already existing:     {skipped}"
+    )
+
+    print(
+        f"Errors:               {errors}"
+    )
+
+    print()
+    print("SEVERITY DISTRIBUTION")
+
+    if severity_counter:
+
+        for severity, count in (
+            severity_counter.most_common()
+        ):
+
+            print(
+                f"{severity:20} {count}"
+            )
+
+    else:
+
+        print(
+            "No new alerts."
+        )
+
+    print()
+    print("ALERT TYPES")
+
+    if type_counter:
+
+        for alert_type, count in (
+            type_counter.most_common()
+        ):
+
+            print(
+                f"{alert_type:25} {count}"
+            )
+
+    else:
+
+        print(
+            "No new alert types."
+        )
+
+    print()
+    print(
+        "Database table: alerts"
+    )
+
+    print(
+        f"Completed: "
+        f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+    print("=" * 70)
+
+    db.close()
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+if __name__ == "__main__":
+
+    run_alert_engine()

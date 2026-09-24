@@ -1,0 +1,68 @@
+name: ASNA Hourly Intelligence
+
+on:
+  schedule:
+    - cron: '5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: asna-intelligence
+  cancel-in-progress: false
+
+jobs:
+  intelligence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run collector
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          DISCORD_GUILD_ID: ${{ secrets.DISCORD_GUILD_ID }}
+          INTELLIGENCE_DB: data/intelligence.db
+        run: python -m news.collector
+
+      - name: Run event engine
+        run: python news/event_engine.py
+
+      - name: Run impact engine
+        run: python news/impact_engine.py
+
+      - name: Run alert engine
+        run: python news/alert_engine.py
+
+      - name: Report alerts to Discord
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          DISCORD_GUILD_ID: ${{ secrets.DISCORD_GUILD_ID }}
+          INTELLIGENCE_DB: data/intelligence.db
+        run: python news/discord_reporter.py
+
+      - name: Persist SQLite database
+        run: |
+          git config user.name 'ASNA Pakistan Intelligence Bot'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data/intelligence.db
+          if git diff --cached --quiet; then
+            echo 'No database changes to commit.'
+          else
+            git commit -m 'chore: update intelligence database'
+            git push
+          fi
