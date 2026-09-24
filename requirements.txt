@@ -5,3 +5,4 @@ feedparser>=6.0,<7
 beautifulsoup4>=4.12,<5
 lxml>=5.0,<7
 aiohttp>=3.9,<4
+aiosqlite>=0.20,<1
