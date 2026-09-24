@@ -30,9 +30,12 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt
-
-      - name: Run collector
+        run: |
+            python -m pip install --upgrade pip
+             python -m pip install -r requirements.txt
+            python -m pip install aiohttp aiosqlite
+            python -c "import aiohttp, aiosqlite; print('aiohttp:', aiohttp.__version__); print('aiosqlite:', aiosqlite.__version__)"
+            - name: Run collector
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           DISCORD_GUILD_ID: ${{ secrets.DISCORD_GUILD_ID }}
